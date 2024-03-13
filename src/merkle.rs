@@ -57,44 +57,11 @@ use std::rc::Rc;
 pub type Data = Vec<u8>;
 pub type Hash = Vec<u8>;
 
-// node struct
-#[derive(Debug, PartialEq, Eq, Clone)]
-struct Node {
-    hash: Hash,
-    left: Option<Rc<Node>>,
-    right: Option<Rc<Node>>,
-}
-
-impl Node {
-    fn new(hash: Hash) -> Self {
-        Node {
-            hash,
-            left: None,
-            right: None,
-        }
-    }
-
-    // create a new leaf node
-    fn leaf(data: &Data) -> Self {
-        Node::new(hash_data(data))
-    }
-
-    // create a new branch node
-    fn branch(left: &Rc<Node>, right: &Rc<Node>) -> Self {
-        // Calculate the combined hash of these two child nodes
-        let combined_hash = hash_concat(&left.hash, &right.hash);
-
-        Node {
-            hash: combined_hash,
-            left: Some(Rc::clone(left)),
-            right: Some(Rc::clone(right)),
-        }
-    }
-}
-
 #[derive(PartialEq, Debug)]
 pub struct MerkleTree {
-    root: Option<Rc<Node>>,
+    hash: Hash,
+    left: Option<Rc<MerkleTree>>,
+    right: Option<Rc<MerkleTree>>,
 }
 
 /// Which side to put Hash on when concatinating proof hashes
@@ -114,29 +81,19 @@ pub struct Proof<'a> {
 impl MerkleTree {
     /// Gets root hash for this tree
     pub fn root(&self) -> Hash {
-        // Check if the root node exists
-        if let Some(ref root_node) = self.root {
-            // If it does, return a clone of its hash
-            root_node.hash.clone()
-        } else {
-            // If the root node does not exist (the tree is empty), return an empty hash
-            vec![]
-        }
+        self.hash.clone()
     }
 
     /// Constructs a Merkle tree from given input data
     pub fn construct(input: &[Data]) -> MerkleTree {
         // if input is an empty slice, return a tree with an node with a hash of empty vector
         if input.is_empty() {
-            let empty_node = Node::new(hash_data(&vec![]));
-            let empty_node = Rc::new(empty_node);
-            return MerkleTree {
-                root: Some(empty_node),
-            };
+            return MerkleTree::new(hash_data(&vec![]));
         }
 
         // Convert the input data into leaf nodes
-        let mut nodes: Vec<Rc<Node>> = input.iter().map(Node::leaf).map(Rc::new).collect();
+        let mut nodes: Vec<Rc<MerkleTree>> =
+            input.iter().map(MerkleTree::leaf).map(Rc::new).collect();
 
         // Starting from the bottom, merge leaf nodes pairwise until only one root node remains
         while nodes.len() > 1 {
@@ -147,22 +104,19 @@ impl MerkleTree {
                     // If there is only one node, promote it to the next level directly
                     [left] => next_level.push(Rc::clone(left)),
                     [left, right] => {
-                        let parent = Rc::new(Node::branch(&Rc::clone(left), &Rc::clone(right)));
+                        let parent =
+                            Rc::new(MerkleTree::branch(&Rc::clone(left), &Rc::clone(right)));
                         next_level.push(parent);
                     }
                     _ => (),
                 }
             }
-
             // Set 'nodes' to be the next level and continue merging
             nodes = next_level;
         }
 
-        // The remaining node is the root node
-        let root = nodes.pop();
-
-        // Construct MerkleTree
-        MerkleTree { root }
+        // Unwrap the root node from the Rc. It's not safe to unwrap here, but we know that there is only one strong reference to the root node
+        Rc::try_unwrap(nodes.pop().unwrap()).expect("Rc has more than one strong reference")
     }
 
     /// Verifies that the given input data produces the given root hash
@@ -195,7 +149,7 @@ impl MerkleTree {
         let current_data_hash = hash_data(data);
 
         // If the tree is empty, return None immediately
-        let mut current_node = self.root.as_ref()?;
+        let mut current_node: &MerkleTree = self;
 
         // Check if the root node is the only data point
         if current_node.left.is_none() && current_node.right.is_none() {
@@ -212,7 +166,12 @@ impl MerkleTree {
         let mut path: Vec<(HashDirection, &Hash)> = Vec::new();
 
         // If the tree is not just a single node, start traversing
-        while current_node.left.is_some() && current_node.right.is_some() {
+        loop {
+            // leaf node
+            if current_node.left.is_none() && current_node.right.is_none() {
+                break;
+            }
+
             let left = current_node.left.as_ref().unwrap();
             let right = current_node.right.as_ref().unwrap();
 
@@ -245,9 +204,36 @@ impl MerkleTree {
 
         Some(proof)
     }
+}
+
+// some helper functions for MerkleTree
+impl MerkleTree {
+    fn new(hash: Hash) -> Self {
+        MerkleTree {
+            hash,
+            left: None,
+            right: None,
+        }
+    }
+
+    // create a new leaf node
+    fn leaf(data: &Data) -> Self {
+        MerkleTree::new(hash_data(data))
+    }
+
+    // create a new branch node
+    fn branch(left: &Rc<MerkleTree>, right: &Rc<MerkleTree>) -> Self {
+        // Calculate the combined hash of these two child nodes
+        let combined_hash = hash_concat(&left.hash, &right.hash);
+        MerkleTree {
+            hash: combined_hash,
+            left: Some(Rc::clone(left)),
+            right: Some(Rc::clone(right)),
+        }
+    }
 
     // Recursive call to check if the node contains the target hash
-    fn contains_hash(node: &Node, target_hash: &Hash) -> bool {
+    fn contains_hash(node: &MerkleTree, target_hash: &Hash) -> bool {
         // Last layer node, compare the hash value directly
         if &node.hash == target_hash {
             return true;
@@ -315,13 +301,10 @@ mod tests {
     fn test_empty_input_tree_construction() {
         let tree = MerkleTree::construct(&[]);
 
-        let empty_input_node = Rc::new(Node::new(hash_data(&vec![])));
-        let empty_input_merkle_tree = MerkleTree {
-            root: Some(empty_input_node),
-        };
+        let empty_input_node = MerkleTree::new(hash_data(&vec![]));
         let empty_input_root_hash = hash_data(&vec![]);
 
-        assert_eq!(&tree, &empty_input_merkle_tree);
+        assert_eq!(&tree, &empty_input_node);
         assert_eq!(tree.root(), empty_input_root_hash);
     }
 
@@ -353,12 +336,6 @@ mod tests {
         let root = tree.root();
         let five = vec![0x05];
         assert!(!MerkleTree::verify(&[five], &root));
-
-        // empty tree verification
-        // the tree root of empty input does not equal to tree root as None
-        let tree = MerkleTree { root: None };
-        let root = tree.root();
-        assert!(!MerkleTree::verify(&[], &root));
     }
 
     #[test]
@@ -395,19 +372,6 @@ mod tests {
         let tree2 = MerkleTree::construct(&data2);
         let root2 = tree2.root();
         assert!(!MerkleTree::verify_proof(&data1[2], &proof1, &root2));
-
-        // empty tree verification
-        let empty_tree = MerkleTree { root: None };
-        let empty_root = empty_tree.root();
-
-        // empty input tree does not equal to empty tree with root as None
-        let empty_input_tree = MerkleTree::construct(&[]);
-        let empty_input_proof = empty_input_tree.prove(&[].to_vec()).unwrap();
-        assert!(!MerkleTree::verify_proof(
-            &[].to_vec(),
-            &empty_input_proof,
-            &empty_root
-        ));
     }
 
     #[test]
@@ -438,11 +402,6 @@ mod tests {
         let data = example_data(4);
         let tree = MerkleTree::construct(&data);
         let proof = tree.prove(&vec![0x05]);
-        assert_eq!(proof, None);
-
-        // empty tree verification
-        let tree = MerkleTree { root: None };
-        let proof = tree.prove(&[].to_vec());
         assert_eq!(proof, None);
     }
 }
